@@ -1,119 +1,88 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <string.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <sys/types.h>
+#include <unistd.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <net/if.h>
+#include <net/if_arp.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 
-#define MAX_HOSTS 256
-#define PORT 80
+#define START_PORT 1
+#define END_PORT 65535
 
-// 结构体，用于保存主机信息
-struct Host {
-    char hostname[NI_MAXHOST];
-    char ip[INET_ADDRSTRLEN];
-};
-
-// 扫描局域网内的主机
-void scanLAN(struct Host* hosts, int* numHosts) {
-    struct ifreq ifr;
-    struct sockaddr_in *ipaddr;
-    int sockfd, i;
-    
-    // 创建原始套接字
-    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sockfd < 0) {
-        perror("socket creation failed");
+int main(int argc, char *argv[])
+{
+    if (argc != 2) {
+        printf("Usage: %s <interface>\n", argv[0]);
         exit(1);
     }
-    
-    // 获取网络接口的IP地址
-    strncpy(ifr.ifr_name, "eth0", IFNAMSIZ-1);
-    ifr.ifr_name[IFNAMSIZ-1] = '\0';
-    ioctl(sockfd, SIOCGIFADDR, &ifr);
-    
-    // 获取本地IP地址
-    ipaddr = (struct sockaddr_in *)&(ifr.ifr_addr);
-    char* localIP = inet_ntoa(ipaddr->sin_addr);
-    printf("Local IP: %s\n", localIP);
-    
-    // 遍历局域网内的IP地址，尝试连接主机并获取主机名
-    for (i = 1; i <= 254; i++) {
-        char ip[INET_ADDRSTRLEN];
-        snprintf(ip, sizeof(ip), "%s%d", localIP, i);
-        
-        struct sockaddr_in target;
-        target.sin_family = AF_INET;
-        target.sin_port = htons(PORT);
-        inet_pton(AF_INET, ip, &(target.sin_addr));
-        
-        int status = connect(sockfd, (struct sockaddr*)&target, sizeof(target));
-        if (status == 0) {
-            struct Host host;
-            strncpy(host.ip, ip, sizeof(host.ip));
-            getnameinfo((struct sockaddr*)&target, sizeof(target), host.hostname, sizeof(host.hostname), NULL, 0, 0);
-            hosts[*numHosts] = host;
-            (*numHosts)++;
-        }
-    }
-    
-    close(sockfd);
-}
 
-// 扫描主机的开放端口
-void scanPorts(const struct Host* hosts, int numHosts) {
-    int sockfd, i;
-    struct sockaddr_in server;
+    int sockfd;
+    struct arpreq arpreq;
+    struct sockaddr_in *sin;
+    struct in_addr ipaddr;
     struct hostent *host;
-    
-    for (i = 0; i < numHosts; i++) {
-        printf("\nHost: %s (%s)\n", hosts[i].hostname, hosts[i].ip);
-        
-        host = gethostbyname(hosts[i].hostname);
-        if (host == NULL) {
-            perror("gethostbyname() failed");
+    int scanfd;
+    struct sockaddr_in dest_addr;
+
+    // 创建套接字
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd == -1) {
+        perror("socket");
+        exit(1);
+    }
+
+    // 初始化arpreq结构体
+    memset(&arpreq, 0, sizeof(arpreq));
+    sin = (struct sockaddr_in *)&arpreq.arp_pa;
+    sin->sin_family = AF_INET;
+    strncpy(arpreq.arp_dev, argv[1], sizeof(arpreq.arp_dev) - 1);
+
+    // 扫描局域网内的主机
+    for (int i = 1; i <= 254; i++) {
+        // 设置IP地址
+        sin->sin_addr.s_addr = htonl((192 << 24) | (168 << 16) | (1 << 8) | i);
+
+        // 发送ARP请求
+        if (ioctl(sockfd, SIOCGARP, &arpreq) == -1) {
             continue;
         }
-        
-        for (int port = 1; port <= 65535; port++) {
-            sockfd = socket(AF_INET, SOCK_STREAM, 0);
-            if (sockfd < 0) {
-                perror("socket creation failed");
+
+        // 获取主机信息
+        ipaddr = ((struct sockaddr_in *)&arpreq.arp_pa)->sin_addr;
+        host = gethostbyaddr(&ipaddr, sizeof(ipaddr), AF_INET);
+
+        // 打印主机名和IP地址
+        printf("Hostname: %s\n", host ? host->h_name : "unknown");
+        printf("IP: %s\n", inet_ntoa(ipaddr));
+
+        // 初始化目标地址结构体
+        memset(&dest_addr, 0, sizeof(dest_addr));
+        dest_addr.sin_family = AF_INET;
+        dest_addr.sin_addr.s_addr = ipaddr.s_addr;
+
+        // 扫描端口
+        for (int port = START_PORT; port <= END_PORT; port++) {
+            scanfd = socket(AF_INET, SOCK_STREAM, 0);
+            if (scanfd == -1) {
+                perror("socket");
                 exit(1);
             }
-            
-            memset(&server, 0, sizeof(server));
-            server.sin_family = AF_INET;
-            server.sin_port = htons(port);
-            memcpy(&server.sin_addr, host->h_addr_list[0], host->h_length);
-            
-            int status = connect(sockfd, (struct sockaddr*)&server, sizeof(server));
-            if (status == 0) {
+
+            dest_addr.sin_port = htons(port);
+
+            if (connect(scanfd, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) == 0) {
                 printf("Port %d is open\n", port);
             }
-            
-            close(sockfd);
+
+            close(scanfd);
         }
     }
-}
 
-int main() {
-    struct Host hosts[MAX_HOSTS];
-    int numHosts = 0;
-    
-    scanLAN(hosts, &numHosts);
-    
-    printf("Hosts in LAN:\n");
-    for (int i = 0; i < numHosts; i++) {
-        printf("%d. %s (%s)\n", i+1, hosts[i].hostname, hosts[i].ip);
-    }
-    
-    scanPorts(hosts, numHosts);
-    
+    close(sockfd);
+
     return 0;
 }
